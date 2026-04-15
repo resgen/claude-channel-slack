@@ -295,3 +295,70 @@ function checkApprovals(): void {
 }
 
 setInterval(checkApprovals, 5000).unref()
+
+// ── Task 5: Permission Relay ─────────────────────────────────────────────────
+
+const pendingPermissions = new Map<string, { tool_name: string; description: string; input_preview: string }>()
+
+mcp.setNotificationHandler(
+  z.object({
+    method: z.literal('notifications/claude/channel/permission_request'),
+    params: z.object({
+      request_id: z.string(),
+      tool_name: z.string(),
+      description: z.string(),
+      input_preview: z.string(),
+    }),
+  }),
+  async ({ params }) => {
+    const { request_id, tool_name, description, input_preview } = params
+    pendingPermissions.set(request_id, { tool_name, description, input_preview })
+    const access = loadAccess()
+
+    const blocks = [
+      {
+        type: 'section',
+        text: { type: 'mrkdwn', text: `:lock: *Permission:* ${tool_name}` },
+      },
+      {
+        type: 'actions',
+        elements: [
+          {
+            type: 'button',
+            text: { type: 'plain_text', text: 'See more' },
+            action_id: `perm:more:${request_id}`,
+          },
+          {
+            type: 'button',
+            text: { type: 'plain_text', text: 'Allow' },
+            action_id: `perm:allow:${request_id}`,
+            style: 'primary',
+          },
+          {
+            type: 'button',
+            text: { type: 'plain_text', text: 'Deny' },
+            action_id: `perm:deny:${request_id}`,
+            style: 'danger',
+          },
+        ],
+      },
+    ]
+
+    for (const userId of access.allowFrom) {
+      void (async () => {
+        try {
+          const dm = await slackApp!.client.conversations.open({ users: userId })
+          if (dm.channel?.id) {
+            await slackApp!.client.chat.postMessage({
+              channel: dm.channel.id,
+              text: `Permission: ${tool_name}`,
+              blocks,
+            })
+          }
+        } catch (e) {
+          process.stderr.write(`permission_request send to ${userId} failed: ${e}\n`)
+        }
+      })()
+    }
+  },
+)
