@@ -601,3 +601,223 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     return { content: [{ type: 'text', text: `${req.params.name} failed: ${msg}` }], isError: true }
   }
 })
+
+// ── Task 6: Slack App Connection and Inbound Events ──────────────────────────
+
+// Connect MCP over stdio
+await mcp.connect(new StdioServerTransport())
+
+// Initialize Slack Bolt app with Socket Mode
+slackApp = new App({
+  token: BOT_TOKEN,
+  appToken: APP_TOKEN,
+  socketMode: true,
+})
+
+let botUserId: string | undefined
+
+function deliver(
+  chatId: string,
+  messageTs: string,
+  userId: string,
+  text: string,
+  threadTs?: string,
+  fileIds?: string[],
+): void {
+  const meta: Record<string, string> = {
+    chat_id: chatId,
+    message_id: messageTs,
+    user: userId,
+    user_id: userId,
+    ts: new Date().toISOString(),
+  }
+  if (threadTs) meta.thread_ts = threadTs
+  if (fileIds && fileIds.length > 0) {
+    meta.file_count = String(fileIds.length)
+    meta.file_ids = fileIds.join(',')
+  }
+
+  void mcp.notification({
+    method: 'notifications/claude/channel',
+    params: { content: text || '(attachment)', meta },
+  })
+}
+
+// Handle @mentions in channels
+slackApp.event('app_mention', async ({ event }) => {
+  if (event.bot_id) return
+
+  const senderId = event.user
+  const channelId = event.channel
+  const threadTs = event.thread_ts || event.ts
+
+  const result = await gate(senderId, channelId, 'channel', true)
+  if (result.action === 'drop') return
+  if (result.action === 'pair') return
+
+  const text = event.text.replace(/<@[A-Z0-9]+>/g, '').trim()
+
+  const access = result.access
+  const ackReaction = access.ackReaction ?? 'eyes'
+  if (ackReaction) {
+    try {
+      await slackApp!.client.reactions.add({
+        channel: channelId,
+        name: ackReaction,
+        timestamp: event.ts,
+      })
+    } catch {}
+  }
+
+  const fileIds = ((event as any).files ?? []).map((f: any) => f.id)
+
+  deliver(channelId, event.ts, senderId, text, threadTs, fileIds.length > 0 ? fileIds : undefined)
+})
+
+// Handle DMs and thread replies
+slackApp.event('message', async ({ event }) => {
+  const msg = event as any
+  if (msg.subtype || msg.bot_id) return
+  if (msg.user === botUserId) return
+
+  const senderId = msg.user as string
+  const channelId = msg.channel as string
+  const channelType = msg.channel_type as string
+  const threadTs = msg.thread_ts
+
+  const isDM = channelType === 'im'
+  const isMention = !isDM
+
+  const result = await gate(senderId, channelId, isDM ? 'im' : 'channel', isMention)
+
+  if (result.action === 'drop') return
+
+  if (result.action === 'pair') {
+    const lead = result.isResend ? 'Still pending' : 'Pairing required'
+    try {
+      await slackApp!.client.chat.postMessage({
+        channel: channelId,
+        text: `${lead} — run in Claude Code:\n\n\`/slack:access pair ${result.code}\``,
+      })
+    } catch (err) {
+      process.stderr.write(`slack channel: failed to send pairing code: ${err}\n`)
+    }
+    return
+  }
+
+  const text = msg.text as string ?? ''
+
+  if (isDM) {
+    dmChannelUsers.set(channelId, senderId)
+  }
+
+  const permMatch = PERMISSION_REPLY_RE.exec(text)
+  if (permMatch) {
+    void mcp.notification({
+      method: 'notifications/claude/channel/permission',
+      params: {
+        request_id: permMatch[2]!.toLowerCase(),
+        behavior: permMatch[1]!.toLowerCase().startsWith('y') ? 'allow' : 'deny',
+      },
+    })
+    const emoji = permMatch[1]!.toLowerCase().startsWith('y') ? 'white_check_mark' : 'x'
+    try {
+      await slackApp!.client.reactions.add({ channel: channelId, name: emoji, timestamp: msg.ts })
+    } catch {}
+    return
+  }
+
+  const access = result.access
+  const ackReaction = access.ackReaction ?? 'eyes'
+  if (ackReaction) {
+    try {
+      await slackApp!.client.reactions.add({
+        channel: channelId,
+        name: ackReaction,
+        timestamp: msg.ts,
+      })
+    } catch {}
+  }
+
+  const fileIds = (msg.files ?? []).map((f: any) => f.id)
+
+  deliver(
+    channelId,
+    msg.ts,
+    senderId,
+    text,
+    threadTs || msg.ts,
+    fileIds.length > 0 ? fileIds : undefined,
+  )
+})
+
+// Handle permission button clicks
+slackApp.action(/^perm:(allow|deny|more):/, async ({ action, ack, respond }) => {
+  await ack()
+  const buttonAction = action as any
+  const match = /^perm:(allow|deny|more):(.+)$/.exec(buttonAction.action_id)
+  if (!match) return
+
+  const [, behavior, requestId] = match
+  const access = loadAccess()
+
+  if (buttonAction.user && !access.allowFrom.includes(buttonAction.user)) return
+
+  if (behavior === 'more') {
+    const details = pendingPermissions.get(requestId)
+    if (!details) {
+      await respond({ text: 'Details no longer available.', replace_original: false })
+      return
+    }
+    let prettyInput: string
+    try {
+      prettyInput = JSON.stringify(JSON.parse(details.input_preview), null, 2)
+    } catch {
+      prettyInput = details.input_preview
+    }
+    await respond({
+      text: `:lock: *Permission:* ${details.tool_name}\n\n*Tool:* ${details.tool_name}\n*Description:* ${details.description}\n*Input:*\n\`\`\`${prettyInput}\`\`\``,
+      replace_original: true,
+    })
+    return
+  }
+
+  void mcp.notification({
+    method: 'notifications/claude/channel/permission',
+    params: { request_id: requestId, behavior },
+  })
+  pendingPermissions.delete(requestId)
+  const label = behavior === 'allow' ? ':white_check_mark: Allowed' : ':x: Denied'
+  await respond({ text: label, replace_original: true })
+})
+
+// Lifecycle — clean shutdown
+let shuttingDown = false
+function shutdown(): void {
+  if (shuttingDown) return
+  shuttingDown = true
+  process.stderr.write('slack channel: shutting down\n')
+  setTimeout(() => process.exit(0), 2000)
+  void slackApp?.stop().finally(() => process.exit(0))
+}
+process.stdin.on('end', shutdown)
+process.stdin.on('close', shutdown)
+process.on('SIGTERM', shutdown)
+process.on('SIGINT', shutdown)
+
+// Orphan watchdog — detect reparenting (parent died)
+const parentPid = process.ppid
+setInterval(() => {
+  if (process.ppid !== parentPid || process.stdin.destroyed) shutdown()
+}, 5000).unref()
+
+// Start the Slack app
+try {
+  await slackApp.start()
+  const authResult = await slackApp.client.auth.test({})
+  botUserId = authResult.user_id
+  process.stderr.write(`slack channel: connected as ${authResult.user} (${botUserId})\n`)
+} catch (err) {
+  process.stderr.write(`slack channel: failed to start: ${err}\n`)
+  process.exit(1)
+}
