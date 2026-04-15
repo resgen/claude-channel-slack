@@ -362,3 +362,242 @@ mcp.setNotificationHandler(
     }
   },
 )
+
+// ── Task 4: MCP Tools ────────────────────────────────────────────────────────
+
+const dmChannelUsers = new Map<string, string>()
+
+async function fetchAllowedChannel(chatId: string): Promise<void> {
+  const access = loadAccess()
+  if (chatId.startsWith('D')) {
+    const userId = dmChannelUsers.get(chatId)
+    if (userId && access.allowFrom.includes(userId)) return
+  } else {
+    if (chatId in access.channels) return
+  }
+  throw new Error(`channel ${chatId} is not allowlisted — add via /slack:access`)
+}
+
+mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
+  tools: [
+    {
+      name: 'reply',
+      description:
+        'Reply on Slack. Pass chat_id from the inbound message. Use thread_ts for threading. Pass files (absolute paths) for attachments.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string', description: 'Channel or DM ID (C.../D.../G...)' },
+          text: { type: 'string', description: 'Message text (supports Slack mrkdwn)' },
+          thread_ts: { type: 'string', description: 'Thread timestamp for threaded replies' },
+          files: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Absolute file paths to upload as attachments (max 50MB each)',
+          },
+        },
+        required: ['chat_id', 'text'],
+      },
+    },
+    {
+      name: 'react',
+      description: 'Add an emoji reaction to a Slack message.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string' },
+          message_ts: { type: 'string', description: 'Timestamp of the message to react to' },
+          emoji: { type: 'string', description: 'Emoji name without colons (e.g. "thumbsup")' },
+        },
+        required: ['chat_id', 'message_ts', 'emoji'],
+      },
+    },
+    {
+      name: 'edit_message',
+      description: 'Edit a message the bot previously sent. Useful for progress updates.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string' },
+          message_ts: { type: 'string' },
+          text: { type: 'string' },
+        },
+        required: ['chat_id', 'message_ts', 'text'],
+      },
+    },
+    {
+      name: 'download_attachment',
+      description: 'Download a Slack file to the local inbox. Returns the file path for Claude to Read.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          file_id: { type: 'string', description: 'Slack file ID from the inbound message meta' },
+        },
+        required: ['file_id'],
+      },
+    },
+    {
+      name: 'fetch_messages',
+      description:
+        'Fetch recent messages from a Slack channel or thread. Returns oldest-first with timestamps.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          channel: { type: 'string', description: 'Channel ID' },
+          limit: { type: 'number', description: 'Max messages (default 20, max 100)' },
+          thread_ts: { type: 'string', description: 'If provided, fetch thread replies instead of channel history' },
+        },
+        required: ['channel'],
+      },
+    },
+  ],
+}))
+
+mcp.setRequestHandler(CallToolRequestSchema, async req => {
+  const args = (req.params.arguments ?? {}) as Record<string, unknown>
+  try {
+    switch (req.params.name) {
+      case 'reply': {
+        const chatId = args.chat_id as string
+        const text = args.text as string
+        const threadTs = args.thread_ts as string | undefined
+        const files = (args.files as string[] | undefined) ?? []
+
+        await fetchAllowedChannel(chatId)
+
+        for (const f of files) {
+          assertSendable(f)
+          const st = statSync(f)
+          if (st.size > MAX_ATTACHMENT_BYTES) {
+            throw new Error(`file too large: ${f} (${(st.size / 1024 / 1024).toFixed(1)}MB, max 50MB)`)
+          }
+        }
+
+        const access = loadAccess()
+        const limit = Math.max(1, Math.min(access.textChunkLimit ?? MAX_CHUNK_LIMIT, MAX_CHUNK_LIMIT))
+        const mode = access.chunkMode ?? 'length'
+        const chunks = chunk(text, limit, mode)
+        const sentTimestamps: string[] = []
+
+        for (const c of chunks) {
+          const result = await slackApp!.client.chat.postMessage({
+            channel: chatId,
+            text: c,
+            ...(threadTs ? { thread_ts: threadTs } : {}),
+          })
+          if (result.ts) sentTimestamps.push(result.ts)
+        }
+
+        for (const f of files) {
+          await slackApp!.client.files.uploadV2({
+            channel_id: chatId,
+            file: f,
+            filename: basename(f),
+            ...(threadTs ? { thread_ts: threadTs } : {}),
+          })
+        }
+
+        const result = sentTimestamps.length === 1
+          ? `sent (ts: ${sentTimestamps[0]})`
+          : `sent ${sentTimestamps.length} parts (ts: ${sentTimestamps.join(', ')})`
+        return { content: [{ type: 'text', text: result }] }
+      }
+
+      case 'react': {
+        const chatId = args.chat_id as string
+        const messageTs = args.message_ts as string
+        const emoji = args.emoji as string
+        await fetchAllowedChannel(chatId)
+        await slackApp!.client.reactions.add({
+          channel: chatId,
+          name: emoji,
+          timestamp: messageTs,
+        })
+        return { content: [{ type: 'text', text: 'reacted' }] }
+      }
+
+      case 'edit_message': {
+        const chatId = args.chat_id as string
+        const messageTs = args.message_ts as string
+        const text = args.text as string
+        await fetchAllowedChannel(chatId)
+        await slackApp!.client.chat.update({
+          channel: chatId,
+          ts: messageTs,
+          text,
+        })
+        return { content: [{ type: 'text', text: `edited (ts: ${messageTs})` }] }
+      }
+
+      case 'download_attachment': {
+        const fileId = args.file_id as string
+        const info = await slackApp!.client.files.info({ file: fileId })
+        const file = info.file
+        if (!file || !file.url_private_download) {
+          throw new Error(`file ${fileId} not found or not downloadable`)
+        }
+        if ((file.size ?? 0) > MAX_ATTACHMENT_BYTES) {
+          throw new Error(`file too large: ${((file.size ?? 0) / 1024 / 1024).toFixed(1)}MB, max 50MB`)
+        }
+
+        const res = await fetch(file.url_private_download, {
+          headers: { Authorization: `Bearer ${BOT_TOKEN}` },
+        })
+        const buf = Buffer.from(await res.arrayBuffer())
+        const name = file.name ?? fileId
+        const ext = extname(name) || '.bin'
+        const localPath = join(INBOX_DIR, `${Date.now()}-${fileId}${ext}`)
+        mkdirSync(INBOX_DIR, { recursive: true })
+        writeFileSync(localPath, buf)
+
+        const kb = (buf.length / 1024).toFixed(0)
+        return {
+          content: [{ type: 'text', text: `downloaded: ${localPath} (${safeName(name)}, ${kb}KB)` }],
+        }
+      }
+
+      case 'fetch_messages': {
+        const channel = args.channel as string
+        const msgLimit = Math.min((args.limit as number) ?? 20, 100)
+        const threadTs = args.thread_ts as string | undefined
+        await fetchAllowedChannel(channel)
+
+        let messages: any[]
+        if (threadTs) {
+          const result = await slackApp!.client.conversations.replies({
+            channel,
+            ts: threadTs,
+            limit: msgLimit,
+          })
+          messages = result.messages ?? []
+        } else {
+          const result = await slackApp!.client.conversations.history({
+            channel,
+            limit: msgLimit,
+          })
+          messages = (result.messages ?? []).reverse()
+        }
+
+        if (messages.length === 0) {
+          return { content: [{ type: 'text', text: '(no messages)' }] }
+        }
+
+        const botId = (await slackApp!.client.auth.test({})).user_id
+        const out = messages.map((m: any) => {
+          const who = m.user === botId ? 'me' : (m.user ?? 'unknown')
+          const text = (m.text ?? '').replace(/[\r\n]+/g, ' | ')
+          const files = m.files?.length ? ` +${m.files.length}files` : ''
+          return `[${m.ts}] ${who}: ${text}${files}  (ts: ${m.ts})`
+        }).join('\n')
+
+        return { content: [{ type: 'text', text: out }] }
+      }
+
+      default:
+        return { content: [{ type: 'text', text: `unknown tool: ${req.params.name}` }], isError: true }
+    }
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err)
+    return { content: [{ type: 'text', text: `${req.params.name} failed: ${msg}` }], isError: true }
+  }
+})
