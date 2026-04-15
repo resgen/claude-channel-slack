@@ -198,3 +198,100 @@ const mcp = new Server(
     ].join('\n'),
   },
 )
+
+// ── Task 3: Access Control Gate ──────────────────────────────────────────────
+
+type GateResult =
+  | { action: 'deliver'; access: Access }
+  | { action: 'drop' }
+  | { action: 'pair'; code: string; isResend: boolean }
+
+async function gate(senderId: string, channelId: string, channelType: string, isMention: boolean): Promise<GateResult> {
+  const access = loadAccess()
+  const pruned = pruneExpired(access)
+  if (pruned) saveAccess(access)
+
+  if (access.dmPolicy === 'disabled' && channelType === 'im') return { action: 'drop' }
+
+  const isDM = channelType === 'im'
+
+  if (isDM) {
+    if (access.allowFrom.includes(senderId)) return { action: 'deliver', access }
+    if (access.dmPolicy === 'allowlist') return { action: 'drop' }
+
+    // Pairing mode — check for existing code for this sender
+    for (const [code, p] of Object.entries(access.pending)) {
+      if (p.senderId === senderId) {
+        if ((p.replies ?? 1) >= 2) return { action: 'drop' }
+        p.replies = (p.replies ?? 1) + 1
+        saveAccess(access)
+        return { action: 'pair', code, isResend: true }
+      }
+    }
+    // Cap pending at 3
+    if (Object.keys(access.pending).length >= 3) return { action: 'drop' }
+
+    const code = randomBytes(3).toString('hex')
+    const now = Date.now()
+    access.pending[code] = {
+      senderId,
+      chatId: channelId,
+      createdAt: now,
+      expiresAt: now + 60 * 60 * 1000,
+      replies: 1,
+    }
+    saveAccess(access)
+    return { action: 'pair', code, isResend: false }
+  }
+
+  // Channel message — check channel policy
+  const policy = access.channels[channelId]
+  if (!policy) return { action: 'drop' }
+  const channelAllowFrom = policy.allowFrom ?? []
+  if (channelAllowFrom.length > 0 && !channelAllowFrom.includes(senderId)) {
+    return { action: 'drop' }
+  }
+  if (policy.requireMention && !isMention) return { action: 'drop' }
+  return { action: 'deliver', access }
+}
+
+let slackApp: InstanceType<typeof App> | null = null
+
+function checkApprovals(): void {
+  if (!slackApp) return
+  let files: string[]
+  try {
+    files = readdirSync(APPROVED_DIR)
+  } catch { return }
+  if (files.length === 0) return
+
+  for (const senderId of files) {
+    const file = join(APPROVED_DIR, senderId)
+    let dmChannelId: string
+    try {
+      dmChannelId = readFileSync(file, 'utf8').trim()
+    } catch {
+      rmSync(file, { force: true })
+      continue
+    }
+    if (!dmChannelId) {
+      rmSync(file, { force: true })
+      continue
+    }
+
+    void (async () => {
+      try {
+        await slackApp!.client.chat.postMessage({
+          channel: dmChannelId,
+          text: "Paired! Say hi to Claude.",
+        })
+        rmSync(file, { force: true })
+      } catch (err) {
+        process.stderr.write(`slack channel: failed to send approval confirm: ${err}\n`)
+        rmSync(file, { force: true })
+      }
+    })()
+  }
+}
+
+setInterval(checkApprovals, 5000).unref()
