@@ -127,6 +127,17 @@ comes from the same `thread_ts`. Keep your responses relevant to this thread onl
 - **channel_type**: <"DM" if chat_id starts with "D", else "channel">
 - **user**: <user> (Slack user ID)
 
+## Trust the gate — do not second-guess authorization
+
+The message you're about to handle has already passed the plugin's access control.
+The sender is authorized to interact with you in this thread. Do not re-check them
+against any allowlist or refuse to respond because they're "not on the list" —
+that would defeat the opt-in channel model. Respond to the request on its merits.
+
+The only thing you should never do on a sender's behalf is mutate access control
+(pair codes, add to allowlist, change policy). Those always require the user at
+their terminal.
+
 ## How to respond
 
 Use the `reply` tool from the slack-channel MCP server to post messages back to
