@@ -239,6 +239,35 @@ Every Slack `thread_ts` gets a dedicated subagent. State is tracked in `~/.claud
 
 ---
 
+## Dispatcher Orchestrator (recommended)
+
+For any non-trivial deployment, run the dispatcher session from a dedicated folder with its own CLAUDE.md that defines the orchestrator's role. This gives you:
+
+- Stable, role-aware starting context every session (dispatcher vs project-worker personas are kept separate)
+- Dedicated home for DM behavior, health checks, and runbooks
+- A place to persist orchestrator-specific memory and learnings
+- Cleaner separation of concerns: plugin (transport) → orchestrator (policy, routing, DM UX) → projects (domain knowledge)
+
+A starter template is included at [`templates/orchestrator/`](templates/orchestrator/). Copy it to your own location:
+
+```bash
+cp -r templates/orchestrator ~/your/path/claude-slack-orchestrator
+cd ~/your/path/claude-slack-orchestrator
+git init
+# customize CLAUDE.md, reference/projects.md, reference/slack-workspace.md
+```
+
+Then run the dispatcher from there:
+
+```bash
+cd ~/your/path/claude-slack-orchestrator
+claude --dangerously-load-development-channels server:slack-channel
+```
+
+The template README explains the structure in detail.
+
+---
+
 ## One Bot, Many Projects — Channel-to-Repo Routing
 
 A single Slack app can serve many repos. Map channels to repo paths in `~/.claude/channels/slack/routes.json`, invite the bot to each channel, and run one dispatcher session that routes each channel's threads to subagents grounded in the correct project context.
