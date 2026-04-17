@@ -202,6 +202,8 @@ const mcp = new Server(
       '',
       'Every inbound <channel source="slack"> event should be dispatched to a dedicated subagent scoped to the Slack thread_ts, so unrelated conversations stay isolated. Invoke the /slack-channel:threads skill to handle this dispatch — it maintains a persistent thread_ts → agent_id mapping in ~/.claude/channels/slack/threads.json and uses the Agent tool to spawn new thread subagents or SendMessage to resume existing ones.',
       '',
+      'The threads skill also handles channel-to-repo routing via ~/.claude/channels/slack/routes.json. Different Slack channels can be mapped to different repo paths — the dispatcher spawns each subagent with its channel\'s target project context, so one bot can serve many repos.',
+      '',
       'Do NOT reply to Slack directly from the main session. The dispatched subagent calls the reply tool. Your role on the main session is: read the inbound event, invoke /slack-channel:threads, done.',
       '',
       '## Reply tools (for subagents to use)',

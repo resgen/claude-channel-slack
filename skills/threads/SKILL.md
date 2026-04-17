@@ -50,6 +50,29 @@ Every Slack conversation has a `thread_ts` that identifies it uniquely within a 
 
 Always use the exact `thread_ts` attribute from the event as the lookup key. Don't normalize, don't slice — it's a timestamp string like `1718400000.000100`.
 
+## Channel-to-repo routing
+
+To support running a single bot across multiple project channels (one bot, many repos), this skill also reads a **routing config** that maps `chat_id` → target repo. New subagents are dispatched with that repo as their working context.
+
+Routing config: `~/.claude/channels/slack/routes.json`:
+
+```json
+{
+  "C0ASQSQCGCB": {
+    "repo_path": "/absolute/path/to/rfp-knowledge",
+    "label": "RFP Knowledge"
+  },
+  "C0ARZ5AS550": {
+    "repo_path": "/absolute/path/to/sdlc-transformation",
+    "label": "SDLC Transformation"
+  }
+}
+```
+
+The routing config is optional. If a channel isn't listed (or `routes.json` doesn't exist), the subagent uses the dispatcher's current working directory as its context. DMs always use the dispatcher's cwd — DMs don't have project channels so they can't be routed.
+
+Routing applies **only when spawning new subagents**. Existing subagents already know their target repo from their original prompt; follow-up messages in existing threads don't re-resolve routing.
+
 ## Dispatch algorithm
 
 When a `<channel source="slack" chat_id="..." message_id="..." thread_ts="..." user="..." ...>` event arrives:
@@ -66,24 +89,31 @@ mkdir -p ~/.claude/channels/slack
 
 Check if `threads[thread_ts]` exists.
 
-### Step 3a: New thread → spawn a subagent
+### Step 3a: New thread → resolve routing, then spawn a subagent
 
 If no entry exists for this `thread_ts`:
 
-1. Use the `Agent` tool to spawn a subagent with:
+1. **Resolve target repo:**
+   - Read `~/.claude/channels/slack/routes.json` (treat as `{}` if missing or unparseable).
+   - Look up `routes[chat_id]`. If found, use `repo_path` and `label`.
+   - If not found, fall back to the dispatcher's current working directory. Set `label` to the basename of that directory.
+
+2. Use the `Agent` tool to spawn a subagent with:
    - **subagent_type**: `general-purpose`
-   - **description**: `Slack thread <thread_ts short>` (e.g. `Slack thread 1718400000`)
-   - **prompt**: The full subagent prompt template below (see "Subagent prompt template")
+   - **description**: `Slack <label> thread <thread_ts short>` (e.g. `Slack RFP Knowledge thread 1718400000`)
+   - **prompt**: The full subagent prompt template below (see "Subagent prompt template"), filled in with the resolved `repo_path` and `label`.
 
-2. After the Agent tool returns, capture the `agentId` from the result. Claude Code exposes this when an agent is spawned.
+3. After the Agent tool returns, capture the `agentId` from the result. Claude Code exposes this when an agent is spawned.
 
-3. Write the mapping to `threads.json`:
+4. Write the mapping to `threads.json`:
 
 ```json
 {
   "<thread_ts>": {
     "agent_id": "<agentId>",
     "channel_id": "<chat_id from event>",
+    "repo_path": "<repo_path resolved above>",
+    "label": "<label>",
     "last_activity_ms": <now>,
     "topic": "<first ~60 chars of the user's message>"
   }
@@ -110,10 +140,26 @@ The subagent is responsible for calling the `reply` tool to respond to Slack. Th
 
 ## Subagent prompt template
 
-When spawning a new subagent for a Slack thread, use this prompt (fill in the values from the event):
+When spawning a new subagent for a Slack thread, use this prompt (fill in the values from the event and routing resolution):
 
 ```
 You are a dedicated Slack thread handler for the slack-channel plugin.
+
+## Your project context
+
+- **Project:** <label>  (e.g. "RFP Knowledge", "SDLC Transformation")
+- **Repo path:** <repo_path>  (absolute filesystem path)
+
+**First action — IMPORTANT:** Read `<repo_path>/CLAUDE.md`. That file defines this
+project's workflows, conventions, and domain rules. Every piece of work you do
+in this thread should be grounded in what that file tells you. If CLAUDE.md
+references other files (index, templates, library, etc.), know where they are
+and Read them as needed.
+
+For all file operations, use absolute paths rooted at `<repo_path>`. If you run
+Bash commands, prefix with `cd <repo_path> && ...` or use `--cwd <repo_path>`
+where the tool supports it. The parent Claude Code session's cwd may differ
+from your project context — don't rely on relative paths or `pwd`.
 
 ## Your scope
 
@@ -155,8 +201,10 @@ The user said (in Slack):
 "<content from the <channel> event>"
 
 Do the work they requested and reply via the `reply` tool. You have access to the
-full project context — CLAUDE.md, any repo files, all MCP tools available to the
-parent session. Any tool call you make is scoped to this thread's subagent session.
+full project context via the repo path above, plus any user-level skills and MCP
+tools the dispatcher session has access to. Project-level skills specific to
+<repo_path> won't be auto-loaded (subagent inherits from dispatcher's cwd), but
+you can Read any file in the repo directly.
 
 ## Persistence
 
@@ -169,8 +217,10 @@ left off. Treat the thread as an ongoing conversation.
 - Don't respond to messages from other threads (you won't see them).
 - Don't @mention other users unless explicitly asked.
 - Don't post outside this thread.
-- If the user asks you to do something that doesn't fit this thread's topic,
-  ask them to start a new thread rather than switching context mid-conversation.
+- If the user asks you to do something that doesn't fit this thread's project,
+  tell them to move the conversation to the appropriate channel (where a
+  different subagent will handle it with the right project context). Don't
+  switch projects mid-thread.
 ```
 
 ## Follow-up message template

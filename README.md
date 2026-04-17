@@ -222,6 +222,8 @@ Every Slack `thread_ts` gets a dedicated subagent. State is tracked in `~/.claud
   "1718400000.000100": {
     "agent_id": "agent-a3f2c1",
     "channel_id": "C0ASQSQCGCB",
+    "repo_path": "/Users/you/projects/rfp-knowledge",
+    "label": "RFP Knowledge",
     "started_at": "2026-04-17T17:04:35Z",
     "last_activity_ms": 1718500000000,
     "topic": "GA CCNS disaster recovery questions"
@@ -229,11 +231,89 @@ Every Slack `thread_ts` gets a dedicated subagent. State is tracked in `~/.claud
 }
 ```
 
-**New thread:** dispatcher spawns a subagent via the `Agent` tool, saves the mapping.
+**New thread:** dispatcher resolves routing (see next section), spawns a subagent via the `Agent` tool, saves the mapping.
 **Follow-up:** dispatcher looks up the `agent_id` and uses `SendMessage` to resume the subagent. Claude Code auto-resumes stopped subagents from their on-disk transcripts, so the subagent wakes up with full prior context.
 **Persistence:** the mapping file survives session restarts, and Claude Code stores subagent transcripts at `~/.claude/projects/*/subagents/*.jsonl` independently.
 
 **When the parent session is offline:** Slack events queue briefly at Slack and then drop. For 24/7 coverage, run `claude --dangerously-load-development-channels server:slack-channel` inside a persistent terminal (tmux, screen, or a dedicated machine). Conversation state is preserved across restarts, but inbound events require a live session.
+
+---
+
+## One Bot, Many Projects — Channel-to-Repo Routing
+
+A single Slack app can serve many repos. Map channels to repo paths in `~/.claude/channels/slack/routes.json`, invite the bot to each channel, and run one dispatcher session that routes each channel's threads to subagents grounded in the correct project context.
+
+### Setup
+
+1. Create `~/.claude/channels/slack/routes.json`:
+
+```json
+{
+  "C0ASQSQCGCB": {
+    "repo_path": "/Users/you/projects/rfp-knowledge",
+    "label": "RFP Knowledge"
+  },
+  "C0ARZ5AS550": {
+    "repo_path": "/Users/you/projects/sdlc-transformation",
+    "label": "SDLC Transformation"
+  }
+}
+```
+
+See [`routes.example.json`](routes.example.json) for the template.
+
+2. Opt each channel in via `/slack-channel:access`:
+```
+/slack-channel:access channel add C0ASQSQCGCB
+/slack-channel:access channel add C0ARZ5AS550
+```
+
+3. Invite the bot to each Slack channel: `/invite @YourBot` in Slack.
+
+4. Start one dispatcher session (cwd doesn't matter much — subagents run in their routed repos regardless):
+
+```bash
+claude --dangerously-load-development-channels server:slack-channel
+```
+
+### How it works
+
+When a new thread arrives:
+- Dispatcher looks up `chat_id` in `routes.json`
+- Subagent is spawned with the target `repo_path` baked into its prompt
+- First thing the subagent does is `Read <repo_path>/CLAUDE.md` to load project workflows
+- All file operations use absolute paths rooted at the target repo
+
+Follow-ups in an existing thread resume the same subagent — routing is resolved once per thread, at creation.
+
+DMs and unmapped channels fall back to the dispatcher session's cwd as project context.
+
+### What about project-level skills?
+
+The subagent inherits skills and MCP servers from the dispatcher session — so **global skills** (`~/.claude/skills/`, user-scoped plugins) and the dispatcher's cwd repo's skills are available to every subagent. Project-level skills from OTHER routed repos are not auto-loaded (Claude Code only loads skills from one cwd at a time). For knowledge-base-style projects where CLAUDE.md + repo files are the main context, this works well. If you need skills available across projects, put them at the user level (`~/.claude/skills/<name>/`).
+
+### Alternative: per-repo bots
+
+If you want full project-level skill isolation or separate bot identities, you can run **one bot per repo** instead. Each gets its own `SLACK_STATE_DIR`, tokens, and MCP entry:
+
+```json
+{
+  "slack-channel-project-a": {
+    "type": "stdio",
+    "command": "bun",
+    "args": ["run", "--cwd", "/path/to/plugin", "--silent", "start"],
+    "env": { "SLACK_STATE_DIR": "/Users/you/.claude/channels/slack-project-a" }
+  },
+  "slack-channel-project-b": {
+    "type": "stdio",
+    "command": "bun",
+    "args": ["run", "--cwd", "/path/to/plugin", "--silent", "start"],
+    "env": { "SLACK_STATE_DIR": "/Users/you/.claude/channels/slack-project-b" }
+  }
+}
+```
+
+Then start each project's session with its own server name (`--channels server:slack-channel-project-a`). More operational overhead (N Slack apps, N tokens, N sessions to keep running), but complete isolation.
 
 ---
 

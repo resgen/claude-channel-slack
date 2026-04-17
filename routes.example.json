@@ -1,0 +1,12 @@
+{
+  "_comment": "Copy to ~/.claude/channels/slack/routes.json and edit. Maps Slack channel IDs to target repo paths. Each entry becomes the working context for subagents dispatched from that channel's threads. DMs and unmapped channels fall back to the dispatcher session's cwd.",
+
+  "C0ABC123EXAMPLE": {
+    "repo_path": "/absolute/path/to/project-a",
+    "label": "Project A"
+  },
+  "C0DEF456EXAMPLE": {
+    "repo_path": "/absolute/path/to/project-b",
+    "label": "Project B"
+  }
+}
