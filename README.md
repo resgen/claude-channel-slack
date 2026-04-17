@@ -1,6 +1,62 @@
 # Slack Channel Plugin for Claude Code
 
-A Claude Code plugin that bridges your Slack workspace into a running Claude Code session. Once installed, Claude receives DMs and @mentions directly as channel messages — you can ask Claude questions, share files, and approve tool permissions without leaving Slack. Access is fully gated: DM pairing with code exchange, explicit allowlists, and per-channel opt-in policies keep the bot from responding to anyone you haven't authorized.
+Bridge your Slack workspace into a running Claude Code session. DMs and @mentions arrive in your session as channel events, and Claude replies back through Slack using bot messages, reactions, edits, and file uploads. Built for real conversation: each Slack thread gets its own isolated subagent with persistent memory, so parallel conversations don't bleed into each other and you can pick up threads days later with full context intact.
+
+---
+
+## Highlights
+
+- **Per-thread subagent dispatch** — every unique Slack `thread_ts` spawns a dedicated subagent with its own context window. Parallel conversations stay independent; Claude never mixes up which thread it's in.
+- **Persistence across restarts** — thread state is stored on disk (`~/.claude/channels/slack/threads.json` + Claude Code's built-in subagent storage). Close your terminal, come back tomorrow, reply in a thread — the subagent wakes up with full memory of the prior conversation.
+- **Full Claude Code capability inside Slack** — subagents inherit every tool, skill, MCP server, and CLAUDE.md context from the parent session. Unlike a restricted Agent SDK bot, you get Read/Write/Edit/Bash/WebSearch/WebFetch and everything else natively.
+- **Three-tier access control** — DM pairing with code exchange, explicit allowlists, per-channel opt-in policies. Nothing responds until you authorize it.
+- **Permission relay** — if Claude needs tool approval while you're away, you can approve/deny from Slack via Block Kit buttons or text (`yes <code>` / `no <code>`).
+- **Anti-prompt-injection design** — skills refuse to mutate access control based on channel messages; only the terminal user can pair, allow, or change policy.
+
+---
+
+## How it works
+
+```
+                Slack workspace
+                       │
+             Socket Mode WebSocket
+                       │
+                       ▼
+              slack-channel plugin
+         (Bun + @slack/bolt + MCP SDK)
+                       │
+         gate() access control → accept/drop/pair
+                       │
+       ┌───────────────┴────────────────┐
+       │                                │
+  notifications/                 reply / react /
+  claude/channel      ◄──────    edit_message
+       │                                │
+       ▼                                │
+      ┌────────────────────────────┐    │
+      │ Running Claude Code session│    │
+      │                            │    │
+      │ /slack-channel:threads     │    │
+      │  dispatches event to       │    │
+      │  per-thread subagent       │    │
+      │                            │    │
+      │  ┌──────────┐ ┌──────────┐ │    │
+      │  │ Thread A │ │ Thread B │ │    │
+      │  │ subagent │ │ subagent │ │────┘
+      │  └──────────┘ └──────────┘ │
+      │                            │
+      │ Each: isolated context,    │
+      │ project CLAUDE.md, all     │
+      │ tools/MCPs, persists       │
+      │ across session restarts    │
+      └────────────────────────────┘
+```
+
+1. A message arrives in Slack (DM or @mention in an opted-in channel).
+2. The plugin's `gate()` checks it against access policy. If authorized, it delivers a `<channel source="slack" thread_ts="..." ...>` notification to the running Claude Code session.
+3. Claude invokes the `/slack-channel:threads` skill, which looks up the `thread_ts` in a mapping file. If it's a new thread, a fresh subagent is spawned via the `Agent` tool; if it's a follow-up, `SendMessage` resumes the existing subagent.
+4. The subagent does the work and calls the `reply` tool (or `react` / `edit_message`) to respond back to Slack in the original thread.
 
 ---
 
@@ -8,7 +64,11 @@ A Claude Code plugin that bridges your Slack workspace into a running Claude Cod
 
 - [Bun](https://bun.sh) (runtime)
 - Claude Code v2.1.80 or later
+- `claude.ai` login (required for channels — API-key-only sessions aren't supported)
 - A Slack workspace where you can create apps
+- `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` set in your environment (enables the `Agent` and `SendMessage` tools that power thread dispatch)
+
+**Enterprise note:** On Team and Enterprise Claude plans, an admin must enable channels in the admin console (Claude Code → Channels → "Allow channel notifications"). Pro/Max personal accounts don't need this.
 
 ---
 
@@ -22,7 +82,7 @@ A Claude Code plugin that bridges your Slack workspace into a running Claude Cod
 ### 2. Enable Socket Mode
 
 1. In the sidebar go to **Settings → Socket Mode** and toggle it **On**.
-2. When prompted, create an **App-Level Token**:
+2. Create an **App-Level Token** when prompted:
    - Name it anything (e.g. "socket-token")
    - Add the scope `connections:write`
    - Click **Generate** and copy the token — it starts with `xapp-`
@@ -35,7 +95,13 @@ A Claude Code plugin that bridges your Slack workspace into a running Claude Cod
    - `message.im`
    - `message.channels`
 
-### 4. Set bot token scopes
+### 4. Enable the Messages tab
+
+1. Go to **Features → App Home**.
+2. Toggle **Messages Tab** on.
+3. Check **Allow users to send Slash commands and messages from the messages tab**.
+
+### 5. Set bot token scopes
 
 Go to **Features → OAuth & Permissions → Scopes → Bot Token Scopes** and add:
 
@@ -54,7 +120,7 @@ Go to **Features → OAuth & Permissions → Scopes → Bot Token Scopes** and a
 | `reactions:write` | Add emoji reactions |
 | `users:read` | Resolve user names |
 
-### 5. Install to workspace
+### 6. Install to workspace
 
 1. Go to **OAuth & Permissions → Install to Workspace**.
 2. Authorize the requested permissions.
@@ -68,34 +134,41 @@ Go to **Features → OAuth & Permissions → Scopes → Bot Token Scopes** and a
 ### Development (clone and load locally)
 
 ```bash
-git clone https://github.com/your-org/claude-channel-slack
+git clone https://github.com/retrodigio/claude-channel-slack ~/dev/claude-channel-slack
+cd ~/dev/claude-channel-slack
+bun install
 ```
 
-Add the plugin to your `.mcp.json` (project-level or user-level):
+Add the server to your user-level MCP config at `~/.claude.json` under `mcpServers`:
 
 ```json
 {
   "mcpServers": {
-    "slack": {
+    "slack-channel": {
+      "type": "stdio",
       "command": "bun",
-      "args": ["run", "--cwd", "/path/to/claude-channel-slack", "--shell=bun", "--silent", "start"]
+      "args": ["run", "--cwd", "/absolute/path/to/claude-channel-slack", "--silent", "start"]
     }
   }
 }
 ```
 
-Start Claude Code with the plugin loaded:
+> **Heads up on naming:** the server key must be something other than `slack`. Claude Code and the `claude-plugins-official` marketplace both ship an MCP server named `slack`; if you use that name here, deduplication may route events to the wrong transport. `slack-channel` is recommended.
+
+Start Claude Code with the channel enabled:
 
 ```bash
-claude --dangerously-load-development-channels server:slack
+claude --dangerously-load-development-channels server:slack-channel
 ```
+
+You should see **"Listening for channel messages from: server:slack-channel"** in the startup banner, and `slack-channel · ✓ connected` under User MCPs in `/mcp`.
 
 ### Configure tokens
 
-Once Claude Code is running, save your Slack tokens:
+With Claude Code running, save your Slack tokens:
 
 ```
-/slack:configure <xoxb-bot-token> <xapp-app-token>
+/slack-channel:configure <xoxb-bot-token> <xapp-app-token>
 ```
 
 Tokens are written to `~/.claude/channels/slack/.env` with permissions `600`. The server reads this file at startup — restart Claude Code after saving tokens for the first time.
@@ -110,11 +183,11 @@ Tokens are written to `~/.claude/channels/slack/.env` with permissions `600`. Th
 2. The bot replies with a pairing command — copy it.
 3. Run it in Claude Code:
    ```
-   /slack:access pair <code>
+   /slack-channel:access pair <code>
    ```
 4. Lock down DM access to approved users only:
    ```
-   /slack:access policy allowlist
+   /slack-channel:access policy allowlist
    ```
 
 ### Enable a channel
@@ -122,30 +195,160 @@ Tokens are written to `~/.claude/channels/slack/.env` with permissions `600`. Th
 To let Claude respond to @mentions in a channel:
 
 ```
-/slack:access channel add <channel-id>
+/slack-channel:access channel add <channel-id>
 ```
 
-Find the channel ID by right-clicking the channel name in Slack → **Copy link** — the ID is the `C...` segment at the end.
+Find the channel ID by right-clicking the channel name in Slack → **View channel details** → scroll to bottom for "Channel ID" (starts with `C` for public or `G` for private).
+
+By default, an opted-in channel requires an explicit @mention of the bot, and anyone in the channel can trigger a response via @mention. To restrict further:
+
+```
+/slack-channel:access channel add <channel-id> --allow U01ABC,U02DEF
+```
+
+### Start talking
+
+- In a DM: just type. The bot acknowledges with :eyes:, dispatches a subagent, and replies in the same DM.
+- In a channel: @mention the bot. Each top-level @mention starts a new thread with its own subagent; follow-ups in that thread route to the same subagent.
 
 ---
 
-## Tool Reference
+## Per-Thread Subagents
 
-These MCP tools are available to Claude once the plugin is running:
+Every Slack `thread_ts` gets a dedicated subagent. State is tracked in `~/.claude/channels/slack/threads.json`:
+
+```json
+{
+  "1718400000.000100": {
+    "agent_id": "agent-a3f2c1",
+    "channel_id": "C0ASQSQCGCB",
+    "started_at": "2026-04-17T17:04:35Z",
+    "last_activity_ms": 1718500000000,
+    "topic": "GA CCNS disaster recovery questions"
+  }
+}
+```
+
+**New thread:** dispatcher spawns a subagent via the `Agent` tool, saves the mapping.
+**Follow-up:** dispatcher looks up the `agent_id` and uses `SendMessage` to resume the subagent. Claude Code auto-resumes stopped subagents from their on-disk transcripts, so the subagent wakes up with full prior context.
+**Persistence:** the mapping file survives session restarts, and Claude Code stores subagent transcripts at `~/.claude/projects/*/subagents/*.jsonl` independently.
+
+**When the parent session is offline:** Slack events queue briefly at Slack and then drop. For 24/7 coverage, run `claude --dangerously-load-development-channels server:slack-channel` inside a persistent terminal (tmux, screen, or a dedicated machine). Conversation state is preserved across restarts, but inbound events require a live session.
+
+---
+
+## Access Control
+
+### Three-tier gate
+
+1. **DM policy** — `pairing` (default), `allowlist`, or `disabled`. Controls who can DM the bot.
+2. **Channel policies** — per-channel opt-in map keyed by channel ID. Optionally require @mentions and/or restrict to specific users.
+3. **Outbound gate** — the `reply` / `react` / `edit_message` / `fetch_messages` tools only target channels and DMs that the inbound gate would accept. Prevents Claude from being tricked into posting to arbitrary channels.
+
+### Trust the gate
+
+If a `<channel source="slack">` event reaches Claude, access control has already approved it. Claude is instructed not to re-check the sender against any allowlist or refuse to respond. Channel mentions go through channel policy, NOT the DM allowlist. The only thing Claude refuses on behalf of a channel message is access-control mutations — those always require the terminal.
+
+### /slack-channel:access commands
+
+```
+/slack-channel:access                           # show status
+/slack-channel:access pair <code>               # approve a pending DM pairing
+/slack-channel:access deny <code>               # reject a pending pairing
+/slack-channel:access allow <userId>            # add to DM allowlist
+/slack-channel:access remove <userId>           # remove from DM allowlist
+/slack-channel:access policy <mode>             # pairing | allowlist | disabled
+/slack-channel:access channel add <channelId>   # opt in a channel (with optional --no-mention, --allow)
+/slack-channel:access channel rm <channelId>    # opt out a channel
+/slack-channel:access set <key> <value>         # tune ackReaction, textChunkLimit, chunkMode, etc.
+```
+
+See [ACCESS.md](ACCESS.md) for the complete access model, `access.json` schema, and security notes.
+
+---
+
+## Permission Relay
+
+When Claude needs a tool approval while you're away from the terminal, the plugin can relay the prompt to Slack. Allowlisted DM users receive a Block Kit message with **Allow** / **Deny** / **See more** buttons, or can reply with a text code (`yes xxxxx` / `no xxxxx`). Permission approvals are scoped to the DM allowlist only — channel members don't get them, because they haven't been explicitly paired.
+
+Powered by the `claude/channel/permission` MCP capability.
+
+---
+
+## MCP Tool Reference
+
+Tools the plugin exposes to the Claude Code session and its subagents:
 
 | Tool | Description |
 |---|---|
-| `reply` | Post a message to a channel or thread |
-| `react` | Add an emoji reaction to a message |
-| `edit_message` | Edit a message the bot previously sent |
-| `download_attachment` | Download a Slack file to the local inbox |
-| `fetch_messages` | Pull channel or thread history |
+| `reply` | Post a message (or file) to a channel/DM, optionally threaded via `thread_ts`. Splits long text at `textChunkLimit`. |
+| `react` | Add an emoji reaction to a message. |
+| `edit_message` | Edit a previously sent bot message — useful for progress updates on long tasks. |
+| `download_attachment` | Download a Slack file to `~/.claude/channels/slack/inbox/` and return the path. |
+| `fetch_messages` | Pull channel or thread history via `conversations.history` / `conversations.replies`. |
+
+All tools validate the target against access policy before acting.
 
 ---
 
-## Note on Channel Support
+## File Layout
 
-Channel support (responding to @mentions in public/private channels, not just DMs) is currently in **research preview** and requires signing in at [claude.ai](https://claude.ai) to use `--dangerously-load-development-channels`.
+```
+claude-channel-slack/
+├── .claude-plugin/plugin.json    # plugin manifest
+├── .mcp.json                     # MCP launch config (plugin-install style)
+├── server.ts                     # entire server: Slack + MCP + gate + tools
+├── skills/
+│   ├── access/SKILL.md           # /slack-channel:access
+│   ├── configure/SKILL.md        # /slack-channel:configure
+│   └── threads/SKILL.md          # /slack-channel:threads (per-thread dispatch)
+├── package.json
+├── README.md
+├── ACCESS.md                     # full access-control reference
+└── LICENSE
+```
+
+Runtime state:
+
+```
+~/.claude/channels/slack/
+├── .env                # SLACK_BOT_TOKEN + SLACK_APP_TOKEN (chmod 600)
+├── access.json         # access policy + per-channel config
+├── threads.json        # thread_ts → subagent mapping
+├── inbox/              # downloaded Slack file attachments
+└── approved/           # one-shot pairing confirmations (server polls every 5s)
+```
+
+---
+
+## Security Model
+
+- **Stdio-only MCP transport** — the server runs as a local subprocess; no network listener.
+- **Token files are chmod 600** — the `.env` gets permissions locked at boot.
+- **`assertSendable()`** — the `reply` tool refuses to upload files from the plugin's own state directory, blocking exfiltration of `.env` or `access.json` via tool abuse.
+- **Filename sanitization** — uploader-controlled filenames are scrubbed of `[]<>;\r\n` before appearing in `<channel>` tag attributes, preventing tag-structure injection.
+- **Pairing never auto-picks** — even with a single pending code, `/slack-channel:access pair` requires the explicit code. Prevents an attacker from seeding one pending entry and getting it auto-approved via prompt injection.
+- **Permission relay is DM-only** — approval buttons never go to channel members, only to users on the DM allowlist.
+- **Orphan watchdog** — the server exits cleanly if its parent Claude Code process dies, preventing zombies that hold the Socket Mode token hostage.
+
+---
+
+## Common Issues
+
+**"1 MCP server failed" with no details**
+Start Claude Code with `--debug` and check the log path it prints. Look for `slack-channel:` lines in the log to see startup errors. Common causes: missing tokens, wrong working directory in the MCP config, or a conflicting MCP server named `slack`.
+
+**Bot doesn't respond to DMs**
+Check `/mcp` shows `slack-channel · ✓ connected`. Verify the Slack app has Messages Tab enabled (App Home), `message.im` event subscribed, and you've restarted Slack after the app install (Slack caches the disabled state aggressively).
+
+**Messages in channel drop silently**
+The channel isn't opted in. Run `/slack-channel:access channel add <channelId>` to allow @mentions in that channel.
+
+**Thread subagent has no memory of prior conversation**
+Check `~/.claude/channels/slack/threads.json` has an entry for that `thread_ts`. If missing, the dispatcher will spawn a fresh agent. If present but the agent transcript is missing (rare — would happen if `~/.claude/projects/` was cleared), the dispatcher falls back to a new subagent and posts a notice in the thread.
+
+**"Blocked by org policy" on Team/Enterprise**
+An admin needs to toggle **Allow channel notifications** in claude.ai → Admin settings → Claude Code → Channels.
 
 ---
 
