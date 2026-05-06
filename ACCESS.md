@@ -59,6 +59,16 @@ Slack user IDs look like `U012AB3CD`. Two ways to get one:
 1. Go to Slack preferences and enable **Developer Mode** (Advanced settings).
 2. Right-click any user's name → **Copy member ID**.
 
+## Finding Slack Bot IDs
+
+Bot IDs look like `B0123ABCD` and are separate from user IDs. The reliable way to capture one is to inspect a real message from the bot:
+
+1. Have the bot post in any channel (or trigger an alert if it's an integration bot).
+2. From a workspace admin or any user with the `users:read` scope on a token, fetch the message via `conversations.history` (or watch the raw event in your Slack app's event viewer) — every bot post carries `bot_id`.
+3. Alternatively, if you maintain the bot's Slack app yourself, the `bot_id` is shown in the app's management page under **App Home** / **Basic Information**.
+
+There is no UI to copy a `bot_id` from the Slack desktop client; it's only exposed through the API.
+
 ---
 
 ## Channel Policies
@@ -78,7 +88,13 @@ When true, Claude only responds to messages that @mention the bot. When false, C
 
 ### `allowFrom`
 
-An optional list of Slack user IDs. If non-empty, only those users can trigger Claude in this channel — other senders are ignored even if they @mention the bot. An empty list means any workspace member can trigger Claude in that channel (subject to `requireMention`).
+An optional list of Slack IDs that can trigger Claude in this channel.
+
+For human users (Slack user IDs, `U…`), the list works as a sender restriction: if non-empty, only those users can trigger Claude — other senders are ignored even if they @mention the bot. An empty list means any workspace member can trigger Claude in that channel (subject to `requireMention`).
+
+For bot users (Slack bot IDs, `B…`), the list is **default-deny**: bots are dropped before reaching Claude unless their bot ID is explicitly listed. An empty `allowFrom` blocks all bots, and a populated `allowFrom` blocks any bot whose ID isn't in it. This lets you opt specific bots in (incident pagers, build notifiers, etc.) without inviting every bot in the channel into Claude's context.
+
+Bot DMs are always dropped regardless of allowlist contents.
 
 ---
 
@@ -145,7 +161,7 @@ How to split long messages:
 | `allowFrom` | `string[]` | Slack user IDs approved for DMs |
 | `channels` | `Record<string, ChannelPolicy>` | Per-channel policies (keyed by channel ID) |
 | `channels[id].requireMention` | `boolean` | Require @mention to trigger Claude |
-| `channels[id].allowFrom` | `string[]` | Restrict channel to specific users (empty = all) |
+| `channels[id].allowFrom` | `string[]` | Restrict channel to specific users (`U…`, empty = all humans). Bots (`B…`) are always default-deny: include a bot id here to opt it in. |
 | `pending` | `Record<string, PendingEntry>` | Active pairing codes (managed automatically) |
 | `ackReaction` | `string?` | Emoji for inbound acknowledgment |
 | `doneReaction` | `string?` | Emoji for completion (reserved) |

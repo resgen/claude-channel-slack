@@ -52,7 +52,10 @@ Fields:
 - `allowFrom`: array of Slack user IDs (`U...`) approved for DM access
 - `channels`: map of channel IDs (`C...` or `G...`) to per-channel settings
   - `requireMention`: if true, bot only responds when mentioned
-  - `allowFrom`: channel-level allowlist (empty = use dmPolicy)
+  - `allowFrom`: channel-level allowlist. Accepts both Slack user ids (`U...`) and bot ids (`B...`).
+    - Humans: empty = any sender allowed; populated = only listed humans.
+    - Bots: **default-deny**. A bot is blocked unless its bot id is explicitly listed (empty
+      `allowFrom` blocks all bots; populated `allowFrom` blocks any bot whose id isn't in it).
 - `pending`: map of pairing codes to pending requests (set by the server, cleared here)
 - `ackReaction`: emoji reaction added when a message is received (default: `eyes`)
 - `doneReaction`: emoji reaction added when a response is complete (default: `white_check_mark`)
@@ -181,6 +184,7 @@ Steps:
 - Write with pretty-print JSON (2-space indent) so the file stays human-readable
 - Handle ENOENT on read: if the file doesn't exist, treat as `{}` and initialize with defaults where needed
 - Slack user IDs are `U` followed by alphanumeric characters (e.g., `U012AB34C`)
+- Slack bot IDs are `B` followed by alphanumeric characters (e.g., `B012AB34C`). Bot ids are valid in a channel's `allowFrom` (`channel allow <channel-id> <bot-id>`) but never in the top-level DM `allowFrom` — bots cannot DM the agent and bot ids in the DM allowlist are ignored.
 - Slack channel IDs start with `C` (public/private channels) or `G` (group DMs / legacy private channels)
 - Pairing codes are short alphanumeric strings set by the server — never generate or guess them
 - Never auto-select a pending code, even when only one exists — the user must supply it explicitly
