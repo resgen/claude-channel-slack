@@ -22,6 +22,7 @@ import {
 } from 'fs'
 import { homedir } from 'os'
 import { join, sep, extname, basename } from 'path'
+import { decideChannelPolicy, isBotDMBlocked, type ChannelPolicy } from './gate.ts'
 
 const STATE_DIR = process.env.SLACK_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'slack')
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
@@ -61,11 +62,6 @@ type PendingEntry = {
   createdAt: number
   expiresAt: number
   replies: number
-}
-
-type ChannelPolicy = {
-  requireMention: boolean
-  allowFrom: string[]
 }
 
 type Access = {
@@ -230,14 +226,15 @@ type GateResult =
   | { action: 'drop' }
   | { action: 'pair'; code: string; isResend: boolean }
 
-async function gate(senderId: string, channelId: string, channelType: string, isMention: boolean): Promise<GateResult> {
+async function gate(senderId: string, channelId: string, channelType: string, isMention: boolean, isBot: boolean = false): Promise<GateResult> {
   const access = loadAccess()
   const pruned = pruneExpired(access)
   if (pruned) saveAccess(access)
 
-  if (access.dmPolicy === 'disabled' && channelType === 'im') return { action: 'drop' }
-
   const isDM = channelType === 'im'
+
+  if (access.dmPolicy === 'disabled' && isDM) return { action: 'drop' }
+  if (isBotDMBlocked(isDM ? 'im' : 'channel', isBot)) return { action: 'drop' }
 
   if (isDM) {
     if (access.allowFrom.includes(senderId)) return { action: 'deliver', access }
@@ -268,14 +265,9 @@ async function gate(senderId: string, channelId: string, channelType: string, is
     return { action: 'pair', code, isResend: false }
   }
 
-  // Channel message — check channel policy
-  const policy = access.channels[channelId]
-  if (!policy) return { action: 'drop' }
-  const channelAllowFrom = policy.allowFrom ?? []
-  if (channelAllowFrom.length > 0 && !channelAllowFrom.includes(senderId)) {
-    return { action: 'drop' }
-  }
-  if (policy.requireMention && !isMention) return { action: 'drop' }
+  // Channel message — delegated to pure decideChannelPolicy in gate.ts.
+  const decision = decideChannelPolicy(access.channels[channelId], senderId, isMention, isBot)
+  if (decision === 'drop') return { action: 'drop' }
   return { action: 'deliver', access }
 }
 
@@ -669,13 +661,18 @@ function deliver(
 
 // Handle @mentions in channels
 slackApp.event('app_mention', async ({ event }) => {
-  if (event.bot_id) return
-
-  const senderId = event.user
+  // Symmetric with the message handler: bot posts that @mention this app
+  // are routed through the same allowFrom-based opt-in. In practice bots
+  // rarely @mention apps (forwarder/digest workflows are the main cases),
+  // but keeping the rule consistent avoids a hidden second policy.
+  const ev = event as any
+  const isBot = !!ev.bot_id
+  const senderId: string | undefined = isBot ? ev.bot_id : ev.user
+  if (!senderId) return
   const channelId = event.channel
   const threadTs = event.thread_ts || event.ts
 
-  const result = await gate(senderId, channelId, 'channel', true)
+  const result = await gate(senderId, channelId, 'channel', true, isBot)
   if (result.action === 'drop') return
   if (result.action === 'pair') return
 
@@ -701,10 +698,23 @@ slackApp.event('app_mention', async ({ event }) => {
 // Handle DMs and thread replies
 slackApp.event('message', async ({ event }) => {
   const msg = event as any
-  if (msg.subtype || msg.bot_id) return
+  // Slack distinguishes bot posts in two ways depending on app age:
+  //   1. Modern apps (granular permissions) post with NO subtype, but
+  //      bot_id and bot_profile are populated.
+  //   2. Legacy / incoming-webhook integrations post with
+  //      subtype === 'bot_message' and bot_id populated.
+  // We accept both paths and drop every other subtype (channel_join,
+  // message_changed, file_share, thread_broadcast, etc.) — the existing
+  // upstream behaviour for non-bot-message subtypes.
+  const isBot = !!msg.bot_id
+  if (msg.subtype && msg.subtype !== 'bot_message') return
   if (msg.user === botUserId) return
 
-  const senderId = msg.user as string
+  // For bots, identify by bot_id (B-prefix) since msg.user may be unset on
+  // classic incoming-webhook posts. Operators allowlist bot ids in a channel's
+  // allowFrom to opt them in.
+  const senderId = isBot ? (msg.bot_id as string) : (msg.user as string)
+  if (!senderId) return
   const channelId = msg.channel as string
   const channelType = msg.channel_type as string
   const threadTs = msg.thread_ts
@@ -712,7 +722,7 @@ slackApp.event('message', async ({ event }) => {
   const isDM = channelType === 'im'
   const isMention = !isDM
 
-  const result = await gate(senderId, channelId, isDM ? 'im' : 'channel', isMention)
+  const result = await gate(senderId, channelId, isDM ? 'im' : 'channel', isMention, isBot)
 
   if (result.action === 'drop') return
 
